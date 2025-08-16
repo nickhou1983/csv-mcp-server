@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "csv-mcp-server": {
+      "command": "node",
+      "args": ["/Users/houqifeng/Codes/csv-mcp-server/dist/index.js"],
+      "description": "CSV文件操作MCP服务器",
+      "allowedHosts": ["*"]
+    }
+  }
+}
