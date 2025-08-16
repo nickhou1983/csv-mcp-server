@@ -15,8 +15,17 @@ interface CsvRow {
   [key: string]: string;
 }
 
+interface ReadLog {
+  filePath: string;
+  lastReadRow: number;
+  totalRows: number;
+  lastReadTime: string;
+  readRanges: Array<{ start: number; end: number; readTime: string }>;
+}
+
 class CsvMcpServer {
   private server: Server;
+  private logDir: string;
 
   constructor() {
     this.server = new Server(
@@ -31,8 +40,16 @@ class CsvMcpServer {
       }
     );
 
+    // 设置日志目录
+    this.logDir = path.join(process.cwd(), '.csv-logs');
+    this.ensureLogDir();
+
     this.setupTools();
     this.setupToolHandlers();
+  }
+
+  private async ensureLogDir() {
+    await fs.ensureDir(this.logDir);
   }
 
   private setupTools() {
@@ -41,7 +58,7 @@ class CsvMcpServer {
         tools: [
           {
             name: "read_csv",
-            description: "读取CSV文件，支持指定行数限制",
+            description: "读取CSV文件，支持指定行数限制，自动跳过已读取的行",
             inputSchema: {
               type: "object",
               properties: {
@@ -59,8 +76,44 @@ class CsvMcpServer {
                   description: "跳过的行数（可选）",
                   minimum: 0,
                 },
+                use_log: {
+                  type: "boolean",
+                  description: "是否使用读取日志来跳过已读取的行（默认true）",
+                },
+                force_read: {
+                  type: "boolean",
+                  description: "是否强制读取（忽略日志，默认false）",
+                },
               },
               required: ["file_path"],
+            },
+          },
+          {
+            name: "read_csv_range",
+            description: "读取CSV文件的指定行数范围",
+            inputSchema: {
+              type: "object",
+              properties: {
+                file_path: {
+                  type: "string",
+                  description: "CSV文件的完整路径",
+                },
+                start_row: {
+                  type: "number",
+                  description: "开始行号（从0开始）",
+                  minimum: 0,
+                },
+                end_row: {
+                  type: "number",
+                  description: "结束行号（不包含，从0开始）",
+                  minimum: 1,
+                },
+                save_to_log: {
+                  type: "boolean",
+                  description: "是否保存读取记录到日志（默认true）",
+                },
+              },
+              required: ["file_path", "start_row", "end_row"],
             },
           },
           {
@@ -170,6 +223,42 @@ class CsvMcpServer {
               required: ["file_path", "column", "value"],
             },
           },
+          {
+            name: "get_read_log",
+            description: "获取CSV文件的读取日志信息",
+            inputSchema: {
+              type: "object",
+              properties: {
+                file_path: {
+                  type: "string",
+                  description: "CSV文件的完整路径",
+                },
+              },
+              required: ["file_path"],
+            },
+          },
+          {
+            name: "clear_read_log",
+            description: "清除CSV文件的读取日志",
+            inputSchema: {
+              type: "object",
+              properties: {
+                file_path: {
+                  type: "string",
+                  description: "CSV文件的完整路径",
+                },
+              },
+              required: ["file_path"],
+            },
+          },
+          {
+            name: "list_read_logs",
+            description: "列出所有CSV文件的读取日志",
+            inputSchema: {
+              type: "object",
+              properties: {},
+            },
+          },
         ],
       };
     });
@@ -183,6 +272,8 @@ class CsvMcpServer {
         switch (name) {
           case "read_csv":
             return await this.handleReadCsv(args || {}) as any;
+          case "read_csv_range":
+            return await this.handleReadCsvRange(args || {}) as any;
           case "write_csv":
             return await this.handleWriteCsv(args || {}) as any;
           case "add_csv_row":
@@ -193,6 +284,12 @@ class CsvMcpServer {
             return await this.handleUpdateCsvRow(args || {}) as any;
           case "query_csv":
             return await this.handleQueryCsv(args || {}) as any;
+          case "get_read_log":
+            return await this.handleGetReadLog(args || {}) as any;
+          case "clear_read_log":
+            return await this.handleClearReadLog(args || {}) as any;
+          case "list_read_logs":
+            return await this.handleListReadLogs(args || {}) as any;
           default:
             throw new Error(`未知的工具: ${name}`);
         }
@@ -211,39 +308,69 @@ class CsvMcpServer {
   }
 
   private async handleReadCsv(args: Record<string, any>) {
-    const { file_path, limit, skip = 0 } = args;
+    const { file_path, limit, skip = 0, use_log = true, force_read = false } = args;
     
     if (!await fs.pathExists(file_path)) {
       throw new Error(`文件不存在: ${file_path}`);
     }
 
+    let actualSkip = skip;
+    let logInfo = null;
+
+    // 如果启用日志且不强制读取，检查读取日志
+    if (use_log && !force_read) {
+      logInfo = await this.getReadLogInfo(file_path);
+      if (logInfo && logInfo.lastReadRow >= 0) {
+        actualSkip = Math.max(skip, logInfo.lastReadRow + 1);
+      }
+    }
+
     const data: CsvRow[] = [];
     let rowCount = 0;
     let skippedCount = 0;
+    let totalProcessed = 0;
 
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       fs.createReadStream(file_path)
         .pipe(csv())
         .on("data", (row: CsvRow) => {
-          if (skippedCount < skip) {
+          if (skippedCount < actualSkip) {
             skippedCount++;
+            totalProcessed++;
             return;
           }
 
           if (!limit || rowCount < limit) {
             data.push(row);
             rowCount++;
+            totalProcessed++;
           }
         })
-        .on("end", () => {
-          resolve({
-            content: [
-              {
-                type: "text",
-                text: `成功读取CSV文件: ${file_path}\n读取了 ${data.length} 行数据\n\n${JSON.stringify(data, null, 2)}`,
-              },
-            ],
-          });
+        .on("end", async () => {
+          try {
+            // 如果启用日志，保存读取记录
+            if (use_log && data.length > 0) {
+              await this.saveReadLog(file_path, actualSkip, actualSkip + data.length - 1, totalProcessed);
+            }
+
+            const message = [
+              `成功读取CSV文件: ${file_path}`,
+              `读取了 ${data.length} 行数据`,
+              actualSkip > skip ? `(基于读取日志，从第 ${actualSkip} 行开始)` : '',
+              use_log ? `读取日志已更新` : ''
+            ].filter(Boolean).join('\n');
+
+            resolve({
+              content: [
+                {
+                  type: "text",
+                  text: `${message}\n\n${JSON.stringify(data, null, 2)}`,
+                },
+              ],
+            });
+          } catch (error) {
+            reject(error);
+          }
         })
         .on("error", (error: any) => {
           reject(new Error(`读取CSV文件失败: ${error.message}`));
@@ -405,6 +532,238 @@ class CsvMcpServer {
           reject(new Error(`读取CSV文件失败: ${error.message}`));
         });
     });
+  }
+
+  // 日志管理方法
+  private getLogFilePath(csvFilePath: string): string {
+    const fileName = path.basename(csvFilePath, '.csv');
+    const hash = Buffer.from(csvFilePath).toString('base64').replace(/[/+=]/g, '_');
+    return path.join(this.logDir, `${fileName}_${hash}.json`);
+  }
+
+  private async getReadLogInfo(csvFilePath: string): Promise<ReadLog | null> {
+    const logFile = this.getLogFilePath(csvFilePath);
+    try {
+      if (await fs.pathExists(logFile)) {
+        const logContent = await fs.readFile(logFile, 'utf8');
+        return JSON.parse(logContent);
+      }
+    } catch (error) {
+      console.error(`读取日志文件失败: ${error}`);
+    }
+    return null;
+  }
+
+  private async saveReadLog(csvFilePath: string, startRow: number, endRow: number, totalRows: number): Promise<void> {
+    const logFile = this.getLogFilePath(csvFilePath);
+    const now = new Date().toISOString();
+    
+    let logInfo: ReadLog = {
+      filePath: csvFilePath,
+      lastReadRow: endRow,
+      totalRows: totalRows,
+      lastReadTime: now,
+      readRanges: []
+    };
+
+    // 读取现有日志
+    const existingLog = await this.getReadLogInfo(csvFilePath);
+    if (existingLog) {
+      logInfo = existingLog;
+      logInfo.lastReadRow = Math.max(logInfo.lastReadRow, endRow);
+      logInfo.totalRows = Math.max(logInfo.totalRows, totalRows);
+      logInfo.lastReadTime = now;
+    }
+
+    // 添加新的读取范围
+    logInfo.readRanges.push({
+      start: startRow,
+      end: endRow,
+      readTime: now
+    });
+
+    // 保持最近50个读取记录
+    if (logInfo.readRanges.length > 50) {
+      logInfo.readRanges = logInfo.readRanges.slice(-50);
+    }
+
+    await fs.writeFile(logFile, JSON.stringify(logInfo, null, 2));
+  }
+
+  // 新的处理方法
+  private async handleReadCsvRange(args: Record<string, any>) {
+    const { file_path, start_row, end_row, save_to_log = true } = args;
+    
+    if (!await fs.pathExists(file_path)) {
+      throw new Error(`文件不存在: ${file_path}`);
+    }
+
+    if (start_row >= end_row) {
+      throw new Error(`开始行号必须小于结束行号`);
+    }
+
+    const data: CsvRow[] = [];
+    let currentRow = 0;
+
+    return new Promise(async (resolve, reject) => {
+      fs.createReadStream(file_path)
+        .pipe(csv())
+        .on("data", (row: CsvRow) => {
+          if (currentRow >= start_row && currentRow < end_row) {
+            data.push(row);
+          }
+          currentRow++;
+          
+          // 如果已经读取到结束行，可以提前结束
+          if (currentRow >= end_row) {
+            return;
+          }
+        })
+        .on("end", async () => {
+          try {
+            // 保存到日志
+            if (save_to_log && data.length > 0) {
+              await this.saveReadLog(file_path, start_row, end_row - 1, currentRow);
+            }
+
+            resolve({
+              content: [
+                {
+                  type: "text",
+                  text: `成功读取CSV文件范围: ${file_path}\n行范围: ${start_row} - ${end_row - 1}\n读取了 ${data.length} 行数据\n${save_to_log ? '读取日志已更新' : ''}\n\n${JSON.stringify(data, null, 2)}`,
+                },
+              ],
+            });
+          } catch (error) {
+            reject(error);
+          }
+        })
+        .on("error", (error: any) => {
+          reject(new Error(`读取CSV文件失败: ${error.message}`));
+        });
+    });
+  }
+
+  private async handleGetReadLog(args: Record<string, any>) {
+    const { file_path } = args;
+    
+    try {
+      const logInfo = await this.getReadLogInfo(file_path);
+      
+      if (!logInfo) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `文件 ${file_path} 没有读取日志记录`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `CSV文件读取日志信息:\n文件路径: ${logInfo.filePath}\n最后读取行: ${logInfo.lastReadRow}\n总行数: ${logInfo.totalRows}\n最后读取时间: ${logInfo.lastReadTime}\n读取历史: ${logInfo.readRanges.length} 次\n\n${JSON.stringify(logInfo, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `获取读取日志失败: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  private async handleClearReadLog(args: Record<string, any>) {
+    const { file_path } = args;
+    
+    try {
+      const logFile = this.getLogFilePath(file_path);
+      
+      if (await fs.pathExists(logFile)) {
+        await fs.remove(logFile);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `已清除文件 ${file_path} 的读取日志`,
+            },
+          ],
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `文件 ${file_path} 没有读取日志记录`,
+            },
+          ],
+        };
+      }
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `清除读取日志失败: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  private async handleListReadLogs(args: Record<string, any>) {
+    try {
+      const logFiles = await fs.readdir(this.logDir);
+      const logs = [];
+      
+      for (const logFile of logFiles) {
+        if (logFile.endsWith('.json')) {
+          try {
+            const logPath = path.join(this.logDir, logFile);
+            const logContent = await fs.readFile(logPath, 'utf8');
+            const logInfo: ReadLog = JSON.parse(logContent);
+            logs.push({
+              file: logInfo.filePath,
+              lastReadRow: logInfo.lastReadRow,
+              totalRows: logInfo.totalRows,
+              lastReadTime: logInfo.lastReadTime,
+              readCount: logInfo.readRanges.length
+            });
+          } catch (error) {
+            console.error(`读取日志文件 ${logFile} 失败:`, error);
+          }
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `找到 ${logs.length} 个CSV文件的读取日志:\n\n${JSON.stringify(logs, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `列出读取日志失败: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 
   async run() {
